@@ -18,15 +18,19 @@
 //! [`zip`]: Combine values from two arrays based on boolean mask
 
 use crate::filter::{SlicesIterator, prep_null_mask_filter};
+use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type};
+use arrow_array::types::{
+    BinaryType, ByteArrayType, ByteViewType, LargeBinaryType, LargeUtf8Type, StringViewType,
+    Utf8Type,
+};
 use arrow_array::*;
 use arrow_buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, OffsetBufferBuilder,
-    ScalarBuffer,
+    ScalarBuffer, ToByteSlice,
 };
-use arrow_data::ArrayData;
 use arrow_data::transform::MutableArrayData;
+use arrow_data::{ArrayData, ByteView};
 use arrow_schema::{ArrowError, DataType};
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
@@ -284,7 +288,9 @@ impl ScalarZipper {
             DataType::LargeBinary => {
                 Arc::new(BytesScalarImpl::<LargeBinaryType>::new(truthy, falsy)) as Arc<dyn ZipImpl>
             },
-            // TODO: Handle Utf8View https://github.com/apache/arrow-rs/issues/8724
+            DataType::Utf8View => {
+                Arc::new(ByteViewScalarImpl::<StringViewType>::new(truthy, falsy)) as Arc<dyn ZipImpl>
+            },
             _ => {
                 Arc::new(FallbackImpl::new(truthy, falsy)) as Arc<dyn ZipImpl>
             },
@@ -654,6 +660,261 @@ fn maybe_prep_null_mask_filter(predicate: &BooleanArray) -> BooleanBuffer {
         let cleaned = prep_null_mask_filter(predicate);
         let (boolean_buffer, _) = cleaned.into_parts();
         boolean_buffer
+    }
+}
+
+struct ByteViewScalarImpl<T: ByteViewType> {
+    truthy: Option<StringViewArray>,
+    falsy: Option<StringViewArray>,
+    phantom: PhantomData<T>,
+}
+
+impl<T: ByteViewType> ByteViewScalarImpl<T> {
+    fn new(truthy_value: &dyn Array, falsy_value: &dyn Array) -> Self {
+        Self {
+            truthy: Self::get_value_from_scalar(truthy_value),
+            falsy: Self::get_value_from_scalar(falsy_value),
+            phantom: PhantomData,
+        }
+    }
+
+    fn get_value_from_scalar(scalar: &dyn Array) -> Option<StringViewArray> {
+        if scalar.is_null(0) {
+            None
+        } else {
+            let value = scalar.as_string_view();
+            Some(value.clone())
+        }
+    }
+
+    fn null_values_string_view_array(len: usize) -> Result<ArrayRef, ArrowError> {
+        let mut mutable = MutableBuffer::with_capacity(0);
+        mutable.repeat_slice_n_times(0.to_byte_slice(), len);
+        let nulls = NullBuffer::new_null(len);
+        let result = unsafe { StringViewArray::new_unchecked(mutable.into(), vec![], Some(nulls)) };
+        Ok(Arc::new(result))
+    }
+
+    fn get_scalar_and_null_buffer_for_single_non_nullable(
+        predicate: BooleanBuffer,
+        value: &StringViewArray,
+    ) -> Result<ArrayRef, ArrowError> {
+        let value_length = predicate.len();
+        let number_of_true = predicate.count_set_bits();
+
+        // Fast path for all nulls
+        if number_of_true == 0 {
+            // All values are null
+            return Self::null_values_string_view_array(predicate.len());
+        }
+
+        let view = value.views()[0];
+        let mut bytes = MutableBuffer::with_capacity(0);
+        // TODO null should be 0 not the view
+        bytes.repeat_slice_n_times(view.to_byte_slice(), value_length);
+
+        let bytes = Buffer::from(bytes);
+        // If a value is true we need the TRUTHY and the null buffer will have 1 (meaning not null)
+        // If a value is false we need the FALSY and the null buffer will have 0 (meaning null)
+        let nulls = NullBuffer::new(predicate);
+
+        let result = unsafe {
+            StringViewArray::new_unchecked(bytes.into(), value.data_buffers().into(), Some(nulls))
+        };
+        Ok(Arc::new(result))
+    }
+
+    fn get_scalar_and_null_buffer_non_nullable_with_buffer_merge(
+        predicate: BooleanBuffer,
+        truthy_val: &StringViewArray,
+        falsy_val: &StringViewArray,
+    ) -> Result<ArrayRef, ArrowError> {
+        // We have two scalars with buffers and mixed true/false values
+        // therefore, we need to recreate the views and merge the buffers
+        let byte_view_truthy = ByteView::from(truthy_val.views()[0]);
+        let byte_view_falsy = ByteView::from(falsy_val.views()[0]);
+
+        let mut builder = StringViewBuilder::new();
+        let block_truthy = builder.append_block(truthy_val.data_buffers()[0].clone());
+        let block_falsy = builder.append_block(falsy_val.data_buffers()[0].clone());
+
+        //TODO This could be further optimized by only create the views once and then copy them
+        unsafe {
+            for p in &predicate {
+                if p {
+                    builder.append_view_unchecked(
+                        block_truthy,
+                        byte_view_truthy.offset,
+                        byte_view_truthy.length,
+                    )
+                } else {
+                    builder.append_view_unchecked(
+                        block_falsy,
+                        byte_view_falsy.offset,
+                        byte_view_falsy.length,
+                    )
+                }
+            }
+        }
+        let result = builder.finish();
+        Ok(Arc::new(result))
+    }
+
+    fn get_scalar_and_null_buffer_for_all_same_value(
+        length: usize,
+        string_view_array: &StringViewArray,
+    ) -> Result<ArrayRef, ArrowError> {
+        let (views, buffers, _) = string_view_array.clone().into_parts();
+        let mut mutable = MutableBuffer::with_capacity(0);
+        mutable.repeat_slice_n_times(views[0].to_byte_slice(), length);
+
+        let result = unsafe {
+            StringViewArray::new_unchecked(
+                mutable.into(),
+                buffers,
+                Some(NullBuffer::new_valid(length)),
+            )
+        };
+        Ok(Arc::new(result))
+    }
+
+    fn get_scalar_and_null_buffer_non_nullable_only_views(
+        predicate: BooleanBuffer,
+        buffers: Vec<Buffer>,
+        truthy_view: u128,
+        falsy_view: u128,
+    ) -> Result<ArrayRef, ArrowError> {
+        let mut mutable = MutableBuffer::new(0);
+        // keep track of how much is filled
+        let mut filled = 0;
+
+        SlicesIterator::from(&predicate).for_each(|(start, end)| {
+            // the gap needs to be filled with falsy values
+            if start > filled {
+                let false_repeat_count = start - filled;
+                // Push false value `repeat_count` times
+                mutable.repeat_slice_n_times(falsy_view.to_byte_slice(), false_repeat_count);
+            }
+            let true_repeat_count = end - start;
+            // fill with truthy values
+            mutable.repeat_slice_n_times(truthy_view.to_byte_slice(), true_repeat_count);
+            filled = end;
+        });
+
+        // the remaining part is falsy
+        if filled < predicate.len() {
+            let false_repeat_count = predicate.len() - filled;
+            mutable.repeat_slice_n_times(falsy_view.to_byte_slice(), false_repeat_count);
+        }
+        let result = unsafe {
+            StringViewArray::new_unchecked(
+                mutable.into(),
+                buffers,
+                Some(NullBuffer::new_valid(predicate.len())),
+            )
+        };
+        Ok(Arc::new(result))
+    }
+
+    fn create_output_on_non_nulls(
+        predicate: BooleanBuffer,
+        result_len: usize,
+        truthy_val: &StringViewArray,
+        falsy_val: &StringViewArray,
+    ) -> Result<ArrayRef, ArrowError> {
+        let true_count = predicate.count_set_bits();
+        match true_count {
+            0 => {
+                // all values are falsy
+                return Self::get_scalar_and_null_buffer_for_all_same_value(result_len, falsy_val);
+            }
+            n if n == predicate.len() => {
+                // all values are truthy
+                return Self::get_scalar_and_null_buffer_for_all_same_value(result_len, truthy_val);
+            }
+            _ => {
+                // values are truthy and falsy
+                match (
+                    truthy_val.total_buffer_bytes_used(),
+                    falsy_val.total_buffer_bytes_used(),
+                ) {
+                    (0, 0) => {
+                        // all values are inlined, no buffers needed
+                        Self::get_scalar_and_null_buffer_non_nullable_only_views(
+                            predicate,
+                            vec![],
+                            truthy_val.views()[0],
+                            falsy_val.views()[0],
+                        )
+                    }
+                    (truthy_buffer_bytes, 0) if truthy_buffer_bytes > 0 => {
+                        // the truthy views contain non-inlined values, we need to keep
+                        // the truthy buffers
+                        Self::get_scalar_and_null_buffer_non_nullable_only_views(
+                            predicate,
+                            truthy_val.data_buffers().to_vec(),
+                            truthy_val.views()[0],
+                            falsy_val.views()[0],
+                        )
+                    }
+                    (0, falsy_buffer_bytes) if falsy_buffer_bytes > 0 => {
+                        // the falsy views contain non-inlined values, we need to keep
+                        // the falsy buffers
+                        Self::get_scalar_and_null_buffer_non_nullable_only_views(
+                            predicate,
+                            falsy_val.data_buffers().to_vec(),
+                            truthy_val.views()[0],
+                            falsy_val.views()[0],
+                        )
+                    }
+                    _ => {
+                        // truthy and falsy values are not inlined. we need to
+                        // merge the buffers and recalculate views
+                        Self::get_scalar_and_null_buffer_non_nullable_with_buffer_merge(
+                            predicate, truthy_val, falsy_val,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T: ByteViewType> Debug for ByteViewScalarImpl<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteViewScalarImpl")
+            .field("truthy", &self.truthy)
+            .field("falsy", &self.falsy)
+            .finish()
+    }
+}
+
+impl<T: ByteViewType> ZipImpl for ByteViewScalarImpl<T> {
+    fn create_output(&self, predicate: &BooleanArray) -> Result<ArrayRef, ArrowError> {
+        let result_len = predicate.len();
+        // Nulls are treated as false
+        let predicate = maybe_prep_null_mask_filter(predicate);
+
+        match (self.truthy.clone(), self.falsy.clone()) {
+            (Some(truthy_val), Some(falsy_val)) => {
+                Self::create_output_on_non_nulls(predicate, result_len, &truthy_val, &falsy_val)
+            }
+            (Some(truthy_val), None) => {
+                Self::get_scalar_and_null_buffer_for_single_non_nullable(predicate, &truthy_val)
+            }
+            (None, Some(falsy_val)) => {
+                let predicate = predicate.not();
+                Self::get_scalar_and_null_buffer_for_single_non_nullable(predicate, &falsy_val)
+            }
+            (None, None) => {
+                // Only nulls, we can just append null views
+                let mut builder = StringViewBuilder::new();
+                for _ in 0..result_len {
+                    builder.append_null();
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+        }
     }
 }
 
@@ -1219,6 +1480,137 @@ mod test {
             falsy_list_item_scalar.clone(),
             truthy_list_item_scalar.clone(),
             falsy_list_item_scalar.clone(),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["hello"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["world"]));
+
+        let mask = BooleanArray::from(vec![true, false, true, false]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            Some("hello"),
+            Some("world"),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view_null() {
+        let scalar_truthy = Scalar::new(StringViewArray::from_iter_values(["hello"]));
+        let scalar_falsy = Scalar::new(StringViewArray::new_null(1));
+
+        let mask = BooleanArray::from(vec![true, true, false, false, true]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_any().downcast_ref::<StringViewArray>().unwrap();
+        let expected = StringViewArray::from_iter(vec![
+            Some("hello"),
+            Some("hello"),
+            None,
+            None,
+            Some("hello"),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view_all_null() {
+        let scalar_truthy = Scalar::new(StringViewArray::new_null(1));
+        let scalar_falsy = Scalar::new(StringViewArray::new_null(1));
+        let mask = BooleanArray::from(vec![true, true]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_any().downcast_ref::<StringViewArray>().unwrap();
+        let expected = StringViewArray::from_iter(vec![None::<String>, None]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_string_array_view_all_true() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["hello"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["world"]));
+
+        let mask = BooleanArray::from(vec![true, true]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![Some("hello"), Some("hello")]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_string_array_view_all_false() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["hello"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["world"]));
+
+        let mask = BooleanArray::from(vec![false, false]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![Some("world"), Some("world")]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_large_strings() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["longer than 12 bytes"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["another longer than 12 bytes"]));
+
+        let mask = BooleanArray::from(vec![true, false]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![
+            Some("longer than 12 bytes"),
+            Some("another longer than 12 bytes"),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view_one_large_string() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["hello"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["longer than 12 bytes"]));
+
+        let mask = BooleanArray::from(vec![true, false, true, false]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![
+            Some("hello"),
+            Some("longer than 12 bytes"),
+            Some("hello"),
+            Some("longer than 12 bytes"),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view_large_all_true() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["longer than 12 bytes"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["another longer than 12 bytes"]));
+
+        let mask = BooleanArray::from(vec![true, true]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![
+            Some("longer than 12 bytes"),
+            Some("longer than 12 bytes"),
+        ]);
+        assert_eq!(actual, &expected);
+    }
+
+    #[test]
+    fn test_zip_kernel_scalar_strings_array_view_large_all_false() {
+        let scalar_truthy = Scalar::new(StringViewArray::from(vec!["longer than 12 bytes"]));
+        let scalar_falsy = Scalar::new(StringViewArray::from(vec!["another longer than 12 bytes"]));
+
+        let mask = BooleanArray::from(vec![false, false]);
+        let out = zip(&mask, &scalar_truthy, &scalar_falsy).unwrap();
+        let actual = out.as_string_view();
+        let expected = StringViewArray::from(vec![
+            Some("another longer than 12 bytes"),
+            Some("another longer than 12 bytes"),
         ]);
         assert_eq!(actual, &expected);
     }
