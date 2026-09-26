@@ -310,10 +310,14 @@ fn create_page_index_file(
 /// the bytes straight into Arrow arrays.
 fn page_index_benchmark(c: &mut Criterion) {
     let row_groups = 20;
-    let rows_per_group = 1000;
     let data_types = [Int64, Utf8, Decimal128(20, 2)];
+    // 10 rows per page, so 100 or 500 pages per row group: 2000 or 10000 pages
+    let rows_per_group_options = [1000, 5000];
 
-    for data_type in data_types {
+    for (data_type, rows_per_group) in data_types
+        .iter()
+        .flat_map(|t| rows_per_group_options.map(|rows| (t.clone(), rows)))
+    {
         let data = bytes::Bytes::from(create_page_index_file(
             &data_type,
             row_groups,
@@ -364,6 +368,9 @@ fn page_index_benchmark(c: &mut Criterion) {
                     .unwrap();
                 let _ = converter
                     .data_page_null_counts(&page_index, &row_group_indices)
+                    .unwrap();
+                let _ = converter
+                    .data_page_nan_counts(&page_index, &row_group_indices)
                     .unwrap();
             })
         });
